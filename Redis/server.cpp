@@ -8,11 +8,29 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <cassert>
+#include <fcntl.h>
+#include <poll.h>
 
 
 using namespace std;
 
 const size_t k_max_msg = 4096;
+
+enum {
+    STATE_REQ = 0,
+    STATE_RES = 1,
+    STATE_END = 2,
+};
+
+struct Conn {
+    int fd = -1;
+    uint32_t state = 0;
+    size_t rbuf_size = 0;
+    uint8_t rubf[4 + k_max_msg];
+    size_t wbuf_size = 0;
+    size_t wbuf_sent = 0;
+    uint8_t wbuf[4 + k_max_msg];
+};
 
 void die(const string &msg) {
     cout << msg << endl;
@@ -119,28 +137,81 @@ int main() {
         die("listen() error");
     }
 
-    // accept connections
-    while (true) {
-        sockaddr_in client_addr = {};
-        socklen_t addrlen = sizeof(client_addr);
-        int connfd = accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &addrlen);
+    // a map of all clients connections
+    vector<Conn *> fd2conn;
 
-        if (connfd < 0) {
-            msg("accept() error");
-            continue;
+    // set the listen fd to nonblocking mode
+    fd_set_nb(fd);
+
+    // event loop
+    vector<struct pollfd> poll_args;
+    while (true) {
+        poll_args.clear();
+
+        // listening socket is pushed first
+        struct pollfd pfd = {fd, POLLIN, 0};
+        poll_args.push_back(pfd);
+
+        // connection fd
+        for (Conn* conn : fd2conn) {
+            if (!conn) {
+                continue;
+            }
+            struct pollfd pfd = {};
+            pfd.fd = conn -> fd;
+            pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
+            pfd.events = pfd.events | POLLERR;
+            poll_args.push_back(pfd);
         }
 
-        // serve one client connection at once
-        while (true) {
-            int32_t err = one_request(connfd);
-            if (err) {
-                break;
+        // poll active fds
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
+        if (rv < 0){
+            die("poll");
+        }
+
+        // process active fds
+        for (size_t i = 1; i < poll_args.size(); ++i){
+            if (poll_args[i].revents) {
+                Conn *conn = fd2conn[poll_args[i].fd];
+                connection_io(conn);
+                if (conn->state == STATE_END) {
+                    // client closed, destroy connection
+                    fd2conn[conn->fd] = NULL;
+                    (void)close(conn->fd);
+                    free(conn);
+                }
             }
         }
 
-        // do_something(connfd);
-        close(connfd);
+
+
+
     }
+
+
+    // accept connections
+    // while (true) {
+    //     sockaddr_in client_addr = {};
+    //     socklen_t addrlen = sizeof(client_addr);
+    //     int connfd = accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &addrlen);
+
+    //     if (connfd < 0) {
+    //         msg("accept() error");
+    //         continue;
+    //     }
+
+    //     // serve one client connection at once
+    //     while (true) {
+    //         int32_t err = one_request(connfd);
+    //         if (err) {
+    //             break;
+    //         }
+    //     }
+
+    //     // do_something(connfd);
+    //     close(connfd);
+    // }
 
     return 0;
 }
