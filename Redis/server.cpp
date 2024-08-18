@@ -41,31 +41,31 @@ void msg(const string &msg) {
     cout << msg << endl;
 }
 
-static int32_t read_full(int fd, char *buf, size_t n) {
-    while (n > 0) {
-        ssize_t rv = read(fd, buf, n);
-        if (rv <= 0) {
-            return -1;
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv; 
-        buf += rv;
-    }
-    return 0;
-}
+// static int32_t read_full(int fd, char *buf, size_t n) {
+//     while (n > 0) {
+//         ssize_t rv = read(fd, buf, n);
+//         if (rv <= 0) {
+//             return -1;
+//         }
+//         assert((size_t)rv <= n);
+//         n -= (size_t)rv; 
+//         buf += rv;
+//     }
+//     return 0;
+// }
 
-static int32_t write_all(int fd, const char *buf, size_t n) {
-    while (n > 0){
-        ssize_t rv = write(fd, buf, n);
-        if (rv <= 0) {
-            return -1;
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;
-}
+// static int32_t write_all(int fd, const char *buf, size_t n) {
+//     while (n > 0){
+//         ssize_t rv = write(fd, buf, n);
+//         if (rv <= 0) {
+//             return -1;
+//         }
+//         assert((size_t)rv <= n);
+//         n -= (size_t)rv;
+//         buf += rv;
+//     }
+//     return 0;
+// }
 
 static int32_t one_request(int connfd) {
     // 4 bytes header
@@ -106,6 +106,133 @@ static int32_t one_request(int connfd) {
     memcpy(&wbuf[4], reply, len);
     return write_all(connfd, wbuf, 4 + len);
 }
+
+static void conn_put(vector<Conn*> &fd2conn, struct Conn *conn) {
+    if (fd2conn.size() <= (size_t)conn->fd) {
+        fd2conn.resize(conn->fd+1);
+    }
+    fd2conn[conn->fd] = conn;
+}
+
+static int32_t accept_new_conn(vector<Conn*> &fd2conn, int fd){
+    // accept
+    struct sockaddr_in client_addr = {};
+    socklen_t socklen = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr*) &client_addr, &socklen);
+    if (connfd < 0){
+        msg("accept( error)");
+        return -1;
+    }
+
+    fd_set_nb(connfd);
+
+    struct Conn *conn = (struct Conn*) malloc(sizeof(struct Conn));
+    // if no memory available?
+    if (!conn) {
+        close(connfd);
+        return -1;
+    }
+
+    conn -> fd = connfd;
+    conn -> state = STATE_REQ;
+    conn -> rbuf_size = 0;
+    conn -> wbuf_size = 0;
+    conn -> wbuf_sent = 0;
+    conn_put(fd2conn, conn);
+    return 0;
+}
+
+// state machine for client connecions
+static void connectioni_io(Conn *conn) {
+    if (conn -> state == STATE_REQ){
+        state_req(conn);
+    } else if (conn -> state == STATE_RES) {
+        state_res(conn);
+    } else {
+        assert(0);
+    }
+}
+
+// reader state machine
+static void state_req(Conn *conn) {
+    while (try_fill_buffer(conn)){}
+}
+
+static bool try_fill_buffer(Conn* conn) {
+    // try filliing the buffer
+    assert(conn -> rbuf_size < sizeof(conn -> rbuf));
+    ssize_t rv = 0
+    do {
+        size_t cap = sizeof(conn -> rbuf) - conn -> rbuf_size;
+        rv = read(conn -> fd, &conn->rbuf[conn->rbuf_size], cap);
+    } while (rv <0 && errno == EINTR);
+    if (rv <0 && errno == EAGAIN) {
+        return false;
+    }
+    if (rv < 0) {
+        msg("read( error)");
+        conn -> state = STATE_END;
+        return false;
+    }
+    if (rv == 0){
+        if (conn ->rbuf_size > 0){
+            msg("unexpected EOF");
+        } else {
+            msg("EOF");
+        }
+        conn->state = STATE_END;
+        return false;
+    }
+
+    conn -> rbuf_size += (size_t) rv;
+    assert(conn -> rbuf_size <= sizeof(conn -> rbuf));
+
+    // try to process requests one by one
+    while (try_one_request(conn)){}
+    return (conn -> state == STATE_REQ);
+}
+
+static bool try_one_request(Conn *conn) {
+    // parse a request from buffer
+    // not enough data
+    if (conn -> rbuf_size < 4){
+        return false;
+    }
+    uint32_t len = 0;
+
+    memcpy(&len, &conn->rbuf[0], 4);
+    if (len > k_max_msg) {
+        msg("too long");
+        conn->state = STATE_END;
+        return false;
+    }
+    if (4 + len > conn ->rbuf_size) {
+        // not all request data received in the buffer
+        return false;
+    }
+
+    // got a full request msg
+    printf("client says: %.*s\n", len, &conn->rbuf[4]);
+
+    // generate response
+    memcpy(&conn -> wbuf[0], &len, 4);
+    memcpy(&conn -> wbuf[4], &conn ->rbuf[4], len);
+    conn -> wbuf_size = 4 + len;
+
+    // remove request from the buffer
+    size_t remain = conn -> rbuf_size - 4 - len;
+    if (remain) {
+        memmove(conn->rbuf, &conn->rbuf[4+len], remain);
+    }
+    conn->rbuf_size = remain;
+
+    conn -> state = STATE_RES;
+    state_res(conn);
+    return (conn->state == STATE_REQ);
+}
+
+// writer state machine
+
 
 int main() {
     // obtain a socket handle
